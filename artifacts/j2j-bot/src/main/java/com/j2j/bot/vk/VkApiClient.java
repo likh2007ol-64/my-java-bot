@@ -14,7 +14,6 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.File;
-import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
@@ -32,6 +31,7 @@ public class VkApiClient {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Random random = new Random();
 
+    /** GET-based API call — for most methods */
     public JsonNode callMethod(String method, Map<String, String> params) {
         try {
             UriComponentsBuilder builder = UriComponentsBuilder.fromHttpUrl(VK_API_BASE + method)
@@ -43,6 +43,31 @@ public class VkApiClient {
             return objectMapper.readTree(response);
         } catch (Exception e) {
             log.error("VK API call failed: {} — {}", method, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * POST-based API call with application/x-www-form-urlencoded body.
+     * Required for methods that accept large/complex string parameters
+     * (e.g. photos.saveMessagesPhoto where 'photo' is an encoded JSON blob).
+     */
+    public JsonNode callMethodPost(String method, Map<String, String> params) {
+        try {
+            MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+            body.add("access_token", config.getVkToken());
+            body.add("v", VK_API_VERSION);
+            params.forEach(body::add);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+            HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(body, headers);
+
+            ResponseEntity<String> resp = restTemplate.postForEntity(
+                    VK_API_BASE + method, entity, String.class);
+            return objectMapper.readTree(resp.getBody());
+        } catch (Exception e) {
+            log.error("VK API POST call failed: {} — {}", method, e.getMessage());
             return null;
         }
     }
@@ -109,39 +134,114 @@ public class VkApiClient {
     /**
      * Upload a photo for use as a message attachment.
      * Returns attachment string like "photo{owner_id}_{photo_id}" or null on failure.
+     * Retries up to 3 times to handle transient VK upload server errors (504, empty photo).
+     *
+     * VK flow:
+     *   1. photos.getMessagesUploadServer  → upload URL
+     *   2. multipart POST to upload URL   → {server, photo, hash}
+     *   3. photos.saveMessagesPhoto (POST) → photo object
      */
     public String uploadPhoto(File photoFile) {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            String result = tryUploadPhoto(photoFile, attempt);
+            if (result != null) return result;
+            if (attempt < 3) {
+                try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
+                log.info("[{}] Retrying upload (attempt {}/3)...", photoFile.getName(), attempt + 1);
+            }
+        }
+        log.warn("[{}] All 3 upload attempts failed.", photoFile.getName());
+        return null;
+    }
+
+    private String tryUploadPhoto(File photoFile, int attempt) {
         try {
-            JsonNode serverResp = callMethod("photos.getMessagesUploadServer", Map.of("peer_id", "0"));
-            if (serverResp == null || !serverResp.has("response")) {
-                log.warn("Could not get photo upload server");
+            // ── Step 1: get upload URL ──────────────────────────────────────
+            JsonNode serverResp = callMethod("photos.getMessagesUploadServer",
+                    Map.of("peer_id", "0"));
+            if (serverResp == null) {
+                log.warn("[{}] getMessagesUploadServer returned null (network?)", photoFile.getName());
+                return null;
+            }
+            if (serverResp.has("error")) {
+                int code = serverResp.get("error").path("error_code").asInt();
+                String msg  = serverResp.get("error").path("error_msg").asText();
+                log.warn("[{}] VK error getMessagesUploadServer: code={} msg='{}'. " +
+                         "Ensure VK_TOKEN has 'photos' permission (regenerate with photos scope).",
+                        photoFile.getName(), code, msg);
                 return null;
             }
             String uploadUrl = serverResp.get("response").get("upload_url").asText();
+            log.info("[{}] Upload URL obtained, uploading {} bytes...",
+                    photoFile.getName(), photoFile.length());
 
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
-            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-            body.add("photo", new FileSystemResource(photoFile));
-            HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+            // ── Step 2: multipart POST to VK upload server ──────────────────
+            // Explicitly set image/png content-type on the file part
+            HttpHeaders filePartHeaders = new HttpHeaders();
+            filePartHeaders.setContentType(MediaType.IMAGE_PNG);
+            HttpEntity<FileSystemResource> filePart =
+                    new HttpEntity<>(new FileSystemResource(photoFile), filePartHeaders);
 
-            ResponseEntity<String> uploadResp = restTemplate.postForEntity(uploadUrl, requestEntity, String.class);
-            JsonNode uploadResult = objectMapper.readTree(uploadResp.getBody());
+            MultiValueMap<String, Object> multipart = new LinkedMultiValueMap<>();
+            multipart.add("photo", filePart);
+
+            HttpHeaders reqHeaders = new HttpHeaders();
+            reqHeaders.setContentType(MediaType.MULTIPART_FORM_DATA);
+            HttpEntity<MultiValueMap<String, Object>> req = new HttpEntity<>(multipart, reqHeaders);
+
+            ResponseEntity<String> uploadResp = restTemplate.postForEntity(uploadUrl, req, String.class);
+            String rawUpload = uploadResp.getBody();
+            log.info("[{}] Upload server response: {}", photoFile.getName(), rawUpload);
+
+            JsonNode uploadResult = objectMapper.readTree(rawUpload);
+            String photoField = uploadResult.has("photo")
+                    ? uploadResult.get("photo").asText("") : "";
+
+            if (photoField.isBlank() || photoField.equals("[]")) {
+                log.warn("[{}] Upload returned empty photo field — VK rejected the file (wrong format?). Full response: {}",
+                        photoFile.getName(), rawUpload);
+                return null;
+            }
+
+            // ── Step 3: save photo via POST (photo field is large JSON blob) ─
+            String server = uploadResult.has("server")
+                    ? uploadResult.get("server").asText() : "0";
+            String hash   = uploadResult.has("hash")
+                    ? uploadResult.get("hash").asText() : "";
+
+            log.info("[{}] Saving photo (server={}, hash={}, photo_len={})...",
+                    photoFile.getName(), server, hash, photoField.length());
 
             Map<String, String> saveParams = new HashMap<>();
-            saveParams.put("server", uploadResult.get("server").asText());
-            saveParams.put("photo", uploadResult.get("photo").asText());
-            saveParams.put("hash", uploadResult.get("hash").asText());
-            JsonNode saveResp = callMethod("photos.saveMessagesPhoto", saveParams);
+            saveParams.put("server", server);
+            saveParams.put("photo",  photoField);   // raw string — must go via POST body
+            saveParams.put("hash",   hash);
 
-            if (saveResp != null && saveResp.has("response")) {
+            JsonNode saveResp = callMethodPost("photos.saveMessagesPhoto", saveParams);
+
+            if (saveResp == null) {
+                log.warn("[{}] saveMessagesPhoto returned null", photoFile.getName());
+                return null;
+            }
+            if (saveResp.has("error")) {
+                int code = saveResp.get("error").path("error_code").asInt();
+                String msg  = saveResp.get("error").path("error_msg").asText();
+                log.warn("[{}] VK error saveMessagesPhoto: code={} msg='{}'",
+                        photoFile.getName(), code, msg);
+                return null;
+            }
+            if (saveResp.has("response") && saveResp.get("response").size() > 0) {
                 JsonNode photo = saveResp.get("response").get(0);
                 long ownerId = photo.get("owner_id").asLong();
                 long photoId = photo.get("id").asLong();
-                return "photo" + ownerId + "_" + photoId;
+                String attachment = "photo" + ownerId + "_" + photoId;
+                log.info("[{}] ✅ Photo saved successfully: {}", photoFile.getName(), attachment);
+                return attachment;
             }
+            log.warn("[{}] saveMessagesPhoto response has no data: {}",
+                    photoFile.getName(), saveResp);
         } catch (Exception e) {
-            log.warn("Photo upload failed for {}: {}", photoFile.getName(), e.getMessage());
+            log.warn("[{}] Photo upload exception: {}", photoFile.getName(), e.getMessage(), e);
         }
         return null;
     }
