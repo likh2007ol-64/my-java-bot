@@ -84,7 +84,8 @@ public class VkApiClient {
         if (attachment != null && !attachment.isBlank()) {
             params.put("attachment", attachment);
         }
-        JsonNode resp = callMethod("messages.send", params);
+        // POST with form-encoded body — ensures Cyrillic text is encoded correctly
+        JsonNode resp = callMethodPost("messages.send", params);
         if (resp != null && resp.has("error")) {
             log.error("messages.send error: {}", resp.get("error"));
         }
@@ -96,7 +97,8 @@ public class VkApiClient {
         params.put("message", text);
         params.put("random_id", String.valueOf(random.nextInt(Integer.MAX_VALUE)));
         params.put("keyboard", keyboardJson);
-        JsonNode resp = callMethod("messages.send", params);
+        // POST with form-encoded body — ensures Cyrillic text and JSON keyboard are encoded correctly
+        JsonNode resp = callMethodPost("messages.send", params);
         if (resp != null && resp.has("error")) {
             log.error("messages.send (keyboard) error: {}", resp.get("error"));
         }
