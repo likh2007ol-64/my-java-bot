@@ -1,0 +1,12 @@
+target/
+*.class
+*.jar
+*.war
+*.ear
+data/
+*.db
+.idea/
+*.iml
+.mvn/
+mvnw
+mvnw.cmd
