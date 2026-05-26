@@ -40,19 +40,6 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- LangChain4j core -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j</artifactId>
-            <version>${langchain4j.version}</version>
-        </dependency>
-
-        <!-- All-MiniLM-L6-v2 embeddings (multilingual enough for MVP) -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j-embeddings-all-minilm-l6-v2</artifactId>
-            <version>${langchain4j.version}</version>
-        </dependency>
 
         <!-- Apache PDFBox for PDF text extraction -->
         <dependency>
